@@ -91,7 +91,8 @@ struct DatagramVectorReadManager {
     ///     - parseControlMessages: Should control messages be reported up using metadata.
     func readFromSocket(socket: Socket,
                         buffer: inout ByteBuffer,
-                        parseControlMessages: Bool) throws -> ReadResult {
+                        parseControlMessages: Bool,
+                        addressCache: inout DatagramChannel.SocketAddressCache) throws -> ReadResult {
         assert(buffer.readerIndex == 0, "Buffer was not cleared between calls to readFromSocket!")
 
         let messageSize = buffer.capacity / self.messageCount
@@ -102,7 +103,7 @@ struct DatagramVectorReadManager {
 
                 // First we set up the iovec and save it off.
                 self.ioVector[i] = IOVector(iov_base: bufferPointer.baseAddress! + (i * messageSize), iov_len: numericCast(messageSize))
-                
+
                 let controlBytes: UnsafeMutableRawBufferPointer
                 if parseControlMessages {
                     // This will be used in buildMessages below but should not be used beyond return of this function.
@@ -138,7 +139,8 @@ struct DatagramVectorReadManager {
             return self.buildMessages(messageCount: messagesProcessed,
                                       sliceSize: messageSize,
                                       buffer: &buffer,
-                                      parseControlMessages: parseControlMessages)
+                                      parseControlMessages: parseControlMessages,
+                                      addressCache: &addressCache)
         }
     }
 
@@ -153,7 +155,8 @@ struct DatagramVectorReadManager {
     private func buildMessages(messageCount: Int,
                                sliceSize: Int,
                                buffer: inout ByteBuffer,
-                               parseControlMessages: Bool) -> ReadResult {
+                               parseControlMessages: Bool,
+                               addressCache: inout DatagramChannel.SocketAddressCache) -> ReadResult {
         var sliceOffset = buffer.readerIndex
         var totalReadSize = 0
 
@@ -177,8 +180,8 @@ struct DatagramVectorReadManager {
 #else
             precondition(self.messageVector[i].msg_hdr.msg_namelen != 0, "Unexpected zero length peer name")
 #endif
-            let address: SocketAddress = self.sockaddrVector[i].convert()
-            
+            let address = addressCache.socketAddress(for: self.sockaddrVector[i])
+
             // Extract congestion information if requested.
             let metadata: AddressedEnvelope<ByteBuffer>.Metadata?
             if parseControlMessages {

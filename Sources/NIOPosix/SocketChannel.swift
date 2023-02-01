@@ -370,6 +370,7 @@ final class ServerSocketChannel: BaseSocketChannel<ServerSocket> {
 final class DatagramChannel: BaseSocketChannel<Socket> {
     private var reportExplicitCongestionNotifications = false
     private var receivePacketInfo = false
+    private var socketAddressCache = SocketAddressCache()
 
     // Guard against re-entrance of flushNow() method.
     private let pendingWrites: PendingDatagramWritesManager
@@ -637,7 +638,8 @@ final class DatagramChannel: BaseSocketChannel<Socket> {
                     metadata = nil
                 }
 
-                let msg = AddressedEnvelope(remoteAddress: rawAddress.convert(),
+                let remoteAddress = self.socketAddressCache.socketAddress(for: rawAddress)
+                let msg = AddressedEnvelope(remoteAddress: remoteAddress,
                                             data: buffer,
                                             metadata: metadata)
                 assert(self.isActive)
@@ -674,7 +676,8 @@ final class DatagramChannel: BaseSocketChannel<Socket> {
             let result = try vectorReadManager.readFromSocket(
                 socket: self.socket,
                 buffer: &buffer,
-                parseControlMessages: self.reportExplicitCongestionNotifications || self.receivePacketInfo)
+                parseControlMessages: self.reportExplicitCongestionNotifications || self.receivePacketInfo,
+                addressCache: &self.addressCache)
             switch result {
             case .some(let results, let totalRead):
                 assert(self.isOpen)
@@ -841,6 +844,51 @@ final class DatagramChannel: BaseSocketChannel<Socket> {
 
     override func reregister(selector: Selector<NIORegistration>, interested: SelectorEventSet) throws {
         try selector.reregister(selectable: self.socket, interested: interested)
+    }
+}
+
+extension DatagramChannel {
+    internal struct SocketAddressCache {
+        fileprivate struct Key: Hashable {
+            private var addressStorage: sockaddr_storage
+
+            fileprivate init(_ addressStorage: sockaddr_storage) {
+                self.addressStorage = addressStorage
+            }
+
+            fileprivate func hash(into hasher: inout Hasher) {
+                withUnsafeBytes(of: self.addressStorage) {
+                    hasher.combine(bytes: $0)
+                }
+            }
+
+            fileprivate static func == (lhs: Self, rhs: Self) -> Bool {
+                withUnsafeBytes(of: lhs.addressStorage) { lhsBytes in
+                    withUnsafeBytes(of: rhs.addressStorage) { rhsBytes in
+                        return lhsBytes.elementsEqual(rhsBytes)
+                    }
+                }
+            }
+        }
+
+        private var cache: [Key: SocketAddress]
+
+        internal init() {
+            self.cache = [:]
+            self.cache.reserveCapacity(16)
+        }
+
+        mutating func socketAddress(for addressStorage: sockaddr_storage) -> SocketAddress {
+            let key = Key(addressStorage)
+
+            if let cached = self.cache[key] {
+                return cached
+            } else {
+                let computed: SocketAddress = addressStorage.convert()
+                self.cache[key] = computed
+                return computed
+            }
+        }
     }
 }
 

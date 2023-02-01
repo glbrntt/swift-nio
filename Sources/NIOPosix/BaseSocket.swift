@@ -208,7 +208,7 @@ class BaseSocket: BaseSocketProtocol {
         }
         return sock
     }
-    
+
     /// Cleanup the unix domain socket.
     ///
     /// Deletes the associated file if it exists and has socket type. Does nothing if pathname does not exist.
