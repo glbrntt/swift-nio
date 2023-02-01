@@ -848,6 +848,7 @@ final class DatagramChannel: BaseSocketChannel<Socket> {
 }
 
 extension DatagramChannel {
+    // `SocketAddress` allocates twice on `init` when converting from `sockaddr_storage`.
     internal struct SocketAddressCache {
         fileprivate struct Key: Hashable {
             private var addressStorage: sockaddr_storage
@@ -857,6 +858,29 @@ extension DatagramChannel {
             }
 
             fileprivate func hash(into hasher: inout Hasher) {
+                switch NIOBSDSocket.AddressFamily(rawValue: CInt(self.addressStorage.ss_family)) {
+                case .inet:
+                    let sockaddr: sockaddr_in = self.addressStorage.convert()
+                    hasher.combine(sockaddr.sin_family)
+                    hasher.combine(sockaddr.sin_port)
+                    hasher.combine(sockaddr.sin_addr.s_addr)
+                case .inet6:
+                    let sockaddr: sockaddr_in6 = self.addressStorage.convert()
+                    hasher.combine(sockaddr.sin6_family)
+                    hasher.combine(sockaddr.sin6_port)
+                    hasher.combine(sockaddr.sin6_flowinfo)
+                    // hasher.combine(sockaddr.sin6_addr.__u6_addr)
+                    hasher.combine(sockaddr.sin6_scope_id)
+                case .unix:
+                    let sockaddr: sockaddr_un = self.addressStorage.convert()
+                    hasher.combine(sockaddr.sun_family)
+                    withUnsafeBytes(of: sockaddr.sun_path) {
+                        hasher.combine(bytes: $0[..< Int(sockaddr.sun_len)])
+                    }
+                default:
+                    ()
+                }
+
                 withUnsafeBytes(of: self.addressStorage) {
                     hasher.combine(bytes: $0)
                 }
