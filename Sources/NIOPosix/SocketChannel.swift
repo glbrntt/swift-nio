@@ -851,55 +851,92 @@ extension DatagramChannel {
     // `SocketAddress` allocates twice on `init` when converting from `sockaddr_storage`.
     internal struct SocketAddressCache {
         fileprivate struct Key: Hashable {
-            private var addressStorage: sockaddr_storage
+            private enum Address {
+                case inet4(sockaddr_in)
+                case inet6(sockaddr_in6)
+                case unix(sockaddr_un)
+            }
+
+            private var address: Address
 
             fileprivate init(_ addressStorage: sockaddr_storage) {
-                self.addressStorage = addressStorage
+                switch NIOBSDSocket.AddressFamily(rawValue: CInt(addressStorage.ss_family)) {
+                case .inet:
+                    self.address = .inet4(addressStorage.convert())
+                case .inet6:
+                    self.address = .inet6(addressStorage.convert())
+                case .unix:
+                    self.address = .unix(addressStorage.convert())
+                default:
+                    fatalError()
+                }
             }
 
             fileprivate func hash(into hasher: inout Hasher) {
-                switch NIOBSDSocket.AddressFamily(rawValue: CInt(self.addressStorage.ss_family)) {
-                case .inet:
-                    let sockaddr: sockaddr_in = self.addressStorage.convert()
+                switch self.address {
+                case let .inet4(sockaddr):
                     hasher.combine(sockaddr.sin_family)
                     hasher.combine(sockaddr.sin_port)
                     hasher.combine(sockaddr.sin_addr.s_addr)
-                case .inet6:
-                    let sockaddr: sockaddr_in6 = self.addressStorage.convert()
+
+                case let .inet6(sockaddr):
                     hasher.combine(sockaddr.sin6_family)
                     hasher.combine(sockaddr.sin6_port)
                     hasher.combine(sockaddr.sin6_flowinfo)
-                    // hasher.combine(sockaddr.sin6_addr.__u6_addr)
+                    withUnsafeBytes(of: sockaddr.sin6_addr) {
+                        hasher.combine(bytes: $0)
+                    }
                     hasher.combine(sockaddr.sin6_scope_id)
-                case .unix:
-                    let sockaddr: sockaddr_un = self.addressStorage.convert()
+
+                case let .unix(sockaddr):
                     hasher.combine(sockaddr.sun_family)
                     withUnsafeBytes(of: sockaddr.sun_path) {
-                        hasher.combine(bytes: $0[..< Int(sockaddr.sun_len)])
+                        hasher.combine(bytes: .init(fastRebase: $0.prefix(Int(sockaddr.sun_len))))
                     }
-                default:
-                    ()
-                }
-
-                withUnsafeBytes(of: self.addressStorage) {
-                    hasher.combine(bytes: $0)
                 }
             }
 
             fileprivate static func == (lhs: Self, rhs: Self) -> Bool {
-                withUnsafeBytes(of: lhs.addressStorage) { lhsBytes in
-                    withUnsafeBytes(of: rhs.addressStorage) { rhsBytes in
-                        return lhsBytes.elementsEqual(rhsBytes)
-                    }
+                switch (lhs.address, rhs.address) {
+                case let (.inet4(lhsAddr), .inet4(rhsAddr)):
+                    return lhsAddr.sin_port == rhsAddr.sin_port
+                        && lhsAddr.sin_addr.s_addr == rhsAddr.sin_addr.s_addr
+
+                case let (.inet6(lhsAddr), .inet6(rhsAddr)):
+                    return lhsAddr.sin6_port == rhsAddr.sin6_port
+                        && lhsAddr.sin6_flowinfo == rhsAddr.sin6_flowinfo
+                        && lhsAddr.sin6_scope_id == rhsAddr.sin6_scope_id
+                        && withUnsafeBytes(of: lhsAddr.sin6_addr) { lhsBytes in
+                               withUnsafeBytes(of: rhsAddr.sin6_addr) { rhsBytes in
+                                   return lhsBytes.elementsEqual(rhsBytes)
+                               }
+                           }
+
+                case let (.unix(lhsAddr), .unix(rhsAddr)):
+                    return lhsAddr.sun_len == rhsAddr.sun_len
+                        && withUnsafeBytes(of: lhsAddr.sun_path) { lhsBytes in
+                               withUnsafeBytes(of: rhsAddr.sun_path) { rhsBytes in
+                                   let lhsPrefix = lhsBytes.prefix(Int(lhsAddr.sun_len))
+                                   let rhsPrefix = rhsBytes.prefix(Int(rhsAddr.sun_len))
+                                   return lhsPrefix.elementsEqual(rhsPrefix)
+                               }
+                           }
+
+                default:
+                    return false
                 }
             }
         }
 
         private var cache: [Key: SocketAddress]
+        private var insertionOrder: CircularBuffer<Key>
 
-        internal init() {
+        internal init(capacity: Int = 256) {
+            precondition(capacity > 0)
             self.cache = [:]
-            self.cache.reserveCapacity(16)
+            self.insertionOrder = []
+            self.cache.reserveCapacity(capacity)
+            self.insertionOrder.reserveCapacity(capacity)
         }
 
         mutating func socketAddress(for addressStorage: sockaddr_storage) -> SocketAddress {
@@ -907,11 +944,19 @@ extension DatagramChannel {
 
             if let cached = self.cache[key] {
                 return cached
-            } else {
-                let computed: SocketAddress = addressStorage.convert()
-                self.cache[key] = computed
-                return computed
             }
+
+            let computed: SocketAddress = addressStorage.convert()
+
+            // Evict the oldest value if we reach capacity.
+            if self.insertionOrder.count == self.insertionOrder.capacity {
+                let keyToRemove = self.insertionOrder.removeFirst()
+                self.cache.removeValue(forKey: keyToRemove)
+            }
+
+            self.insertionOrder.append(key)
+            self.cache[key] = computed
+            return computed
         }
     }
 }
